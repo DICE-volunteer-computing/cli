@@ -1,0 +1,11 @@
+[package]
+name = "dice-cli"
+version = "0.1.0"
+authors = ["Vale Tolpegin <valetolpegin@gmail.com>"]
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.1.8", features = ["derive"] }
+reqwest = "0.11.14"
+rust-sdk = { path = "../rust-sdk" }
+tokio = { version = "1.25.0", features = ["full"] }
