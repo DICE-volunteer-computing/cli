@@ -1,4 +1,11 @@
-use rust_sdk::model::runtime::{CreateRuntimeDTO, Status, UpdateRuntimeDTO};
+use rust_sdk::model::{
+    artifact::{ArtifactType, CreateArtifactDTO, Status as ArtifactStatus, UpdateArtifactDTO},
+    entity::EntityType,
+    job::CreateJobDTO,
+    job_execution::CreateJobExecutionDTO,
+    project::CreateProjectDTO,
+    runtime::{CreateRuntimeDTO, Status as RuntimeStatus, UpdateRuntimeDTO},
+};
 use std::{
     collections::HashMap,
     env,
@@ -15,17 +22,65 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Arguments {
-    /// Action to upload this runtime to DICE
+    /// Action to create and upload a runtime to DICE
     #[arg(short, long)]
-    upload_runtime: bool,
+    create_runtime: bool,
 
-    /// Name of entity
-    #[arg(short, long, default_value_t = format!("N/A"))]
-    name: String,
+    /// Action to create and upload an input artifact
+    #[arg(short, long)]
+    create_input_artifact: bool,
 
-    /// Associated project ID (optional for some commands, required for others)
-    #[arg(short, long, default_value_t = format!("N/A"))]
-    project_id: String,
+    /// Action to create a new project
+    #[arg(short, long)]
+    create_project: bool,
+
+    /// Action to create a new job
+    #[arg(short, long)]
+    create_job: bool,
+
+    /// Action to create a new job execution
+    #[arg(short, long)]
+    create_job_execution: bool,
+
+    /// Action to get an existing job execution
+    #[arg(short, long)]
+    get_job_execution: bool,
+
+    /// List pending notifications
+    #[arg(short, long)]
+    list_notifications: bool,
+
+    /// Name (optional for some commands, required for others)
+    #[arg(short, long)]
+    name: Option<String>,
+
+    /// Description (optional for some commands, required for others)
+    #[arg(short, long)]
+    description: Option<String>,
+
+    /// Project ID (optional for some commands, required for others)
+    #[arg(short, long)]
+    project_id: Option<String>,
+
+    /// Job ID (optional for some commands, required for others)
+    #[arg(short, long)]
+    job_id: Option<String>,
+
+    /// Job execution ID (optional for some commands, required for others)
+    #[arg(short, long)]
+    job_execution_id: Option<String>,
+
+    /// Runtime ID (optional for some commands, required for others)
+    #[arg(short, long)]
+    runtime_id: Option<String>,
+
+    /// File (optional for some commands, required for others)
+    #[arg(short, long, use_value_delimiter = true, value_delimiter = ',')]
+    input_artifact_ids: Option<Vec<String>>,
+
+    /// File (optional for some commands, required for others)
+    #[arg(short, long)]
+    file: Option<String>,
 }
 
 fn list_files_in_dir(root: &str) -> io::Result<Vec<PathBuf>> {
@@ -60,7 +115,7 @@ fn get_current_dir() -> String {
     name.to_string_lossy().into_owned()
 }
 
-async fn upload_runtime(name: String, project_id: String) {
+async fn create_runtime(name: String, project_id: String) {
     // Validate that I am in a DICE runtime repository
     if is_directory_dice_runtime(".") {
         println!("Validated located in DICE runtime");
@@ -104,32 +159,155 @@ async fn upload_runtime(name: String, project_id: String) {
             .send()
             .await;
         match upload_response {
-            Ok(_) => println!("Successfully uploaded runtime"),
+            Ok(_) => {
+                println!("Successfully uploaded runtime");
+
+                // Set runtime status to active
+                rust_sdk::api::runtime::update(
+                    create_runtime_response.id.clone(),
+                    UpdateRuntimeDTO {
+                        status: RuntimeStatus::Active,
+                    },
+                )
+                .await;
+
+                println!("Created runtime: {}", create_runtime_response.id);
+            }
             Err(err) => println!("Could not upload runtime: {}", err),
         };
-
-        // Set runtime status to active
-        rust_sdk::api::runtime::update(
-            create_runtime_response.id.clone(),
-            UpdateRuntimeDTO {
-                status: Status::Active,
-            },
-        )
-        .await;
-
-        println!("Created runtime: {}", create_runtime_response.id);
     } else {
         println!("NOT IN A DICE RUNTIME");
     }
+}
+
+async fn create_input_artifact(project_id: String, file_name: String) {
+    let tar_file_name = format!("{}.tar", file_name);
+
+    // Compress the file
+    Command::new("tar")
+        .arg("-czf")
+        .arg(tar_file_name.clone())
+        .arg(file_name)
+        .status()
+        .expect("Could not tar the input artifact");
+
+    // Utilizing the rust SDK, get an upload link
+    let create_artifact_response = rust_sdk::api::artifact::create(CreateArtifactDTO {
+        entity_id: project_id,
+        entity_type: EntityType::Project,
+        artifact_type: ArtifactType::Input,
+        tags: HashMap::new(),
+    })
+    .await;
+
+    // Load runtime file
+    let mut file = File::open(tar_file_name).expect("Could not open tar file");
+
+    // Read the file contents into a buffer
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)
+        .expect("Could not read tar file");
+
+    // Upload the compressed file
+    let upload_response = reqwest::Client::new()
+        .put(create_artifact_response.uri)
+        .body(buffer)
+        .send()
+        .await;
+    match upload_response {
+        Ok(_) => {
+            println!("Successfully uploaded input artifact");
+
+            // Set input artifact status to active
+            rust_sdk::api::artifact::update(
+                create_artifact_response.id.clone(),
+                UpdateArtifactDTO {
+                    status: ArtifactStatus::Active,
+                },
+            )
+            .await;
+
+            println!("Created input artifact: {}", create_artifact_response.id);
+        }
+        Err(err) => println!("Could not upload input artifact: {}", err),
+    };
+}
+
+async fn create_project(description: String) {
+    // Utilizing the rust SDK, create a project
+    let project_id = rust_sdk::api::project::create(CreateProjectDTO {
+        description: description,
+        tags: HashMap::new(),
+    })
+    .await;
+
+    println!("Created project: {}", project_id);
+}
+
+async fn create_job(project_id: String, runtime_id: String, input_artifact_ids: Vec<String>) {
+    // Utilizing the rust SDK, create a job
+    let create_job_response = rust_sdk::api::job::create(CreateJobDTO {
+        project_id: project_id,
+        runtime_id: runtime_id,
+        input_artifact_ids: input_artifact_ids,
+        tags: HashMap::new(),
+    })
+    .await;
+
+    println!("Created job: {}", create_job_response.id);
+}
+
+async fn create_job_execution(job_id: String) {
+    // Utilizing the rust SDK, create a job execution
+    let create_job_execution_response =
+        rust_sdk::api::job_execution::create(CreateJobExecutionDTO {
+            job_id: job_id,
+            tags: HashMap::new(),
+        })
+        .await;
+
+    println!(
+        "Created job execution: {}",
+        create_job_execution_response.id
+    );
+}
+
+async fn get_job_execution(job_execution_id: String) {
+    // Utilizing the rust SDK, get an existing job execution
+    let job_execution = rust_sdk::api::job_execution::get(job_execution_id).await;
+
+    println!("Job execution: {:?}", job_execution);
 }
 
 #[tokio::main]
 async fn main() {
     let args = Arguments::parse();
 
-    if args.upload_runtime {
-        println!("Uploading runtime");
-
-        upload_runtime(args.name, args.project_id).await;
+    if args.create_runtime {
+        create_runtime(
+            args.name.expect("--name required"),
+            args.project_id.expect("--project-id required"),
+        )
+        .await;
+    } else if args.create_input_artifact {
+        create_input_artifact(
+            args.project_id.expect("--project-id required"),
+            args.file.expect("--file required"),
+        )
+        .await;
+    } else if args.create_project {
+        create_project(args.description.expect("--description required")).await;
+    } else if args.create_job {
+        create_job(
+            args.project_id.expect("--project-id required"),
+            args.runtime_id.expect("--runtime-id required"),
+            args.input_artifact_ids
+                .expect("--input-artifact-ids required"),
+        )
+        .await;
+    } else if args.create_job_execution {
+        create_job_execution(args.job_id.expect("--job-id required")).await;
+    } else if args.get_job_execution {
+        get_job_execution(args.job_execution_id.expect("--job-execution-id required")).await;
     }
 }
