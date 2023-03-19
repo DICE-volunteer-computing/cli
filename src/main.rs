@@ -1,8 +1,9 @@
+use mongodb::bson::doc;
 use rust_sdk::model::{
     artifact::{ArtifactType, CreateArtifactDTO, Status as ArtifactStatus, UpdateArtifactDTO},
     entity::EntityType,
     job::CreateJobDTO,
-    job_execution::CreateJobExecutionDTO,
+    job_execution::{CreateJobExecutionDTO, Status as JobExecutionStatus},
     project::CreateProjectDTO,
     runtime::{CreateRuntimeDTO, Status as RuntimeStatus, UpdateRuntimeDTO},
 };
@@ -11,7 +12,7 @@ use std::{
     env,
     ffi::OsStr,
     fs::{self, File},
-    io::{self, Read},
+    io::{self, Cursor, Read},
     path::PathBuf,
     process::Command,
 };
@@ -49,6 +50,10 @@ struct Arguments {
     /// List pending notifications
     #[arg(short, long)]
     list_notifications: bool,
+
+    /// Download output artifacts for a job execution into the current directory
+    #[arg(short, long)]
+    download_output_artifacts: bool,
 
     /// Name (optional for some commands, required for others)
     #[arg(short, long)]
@@ -201,7 +206,7 @@ async fn create_input_artifact(project_id: String, file_name: String) {
     .await;
 
     // Load runtime file
-    let mut file = File::open(tar_file_name).expect("Could not open tar file");
+    let mut file = File::open(tar_file_name.clone()).expect("Could not open tar file");
 
     // Read the file contents into a buffer
     let mut buffer = Vec::new();
@@ -217,6 +222,12 @@ async fn create_input_artifact(project_id: String, file_name: String) {
     match upload_response {
         Ok(_) => {
             println!("Successfully uploaded input artifact");
+
+            //  Delete tar file
+            Command::new("rm")
+                .arg(tar_file_name)
+                .status()
+                .expect("Could not delete tar file");
 
             // Set input artifact status to active
             rust_sdk::api::artifact::update(
@@ -279,6 +290,64 @@ async fn get_job_execution(job_execution_id: String) {
     println!("Job execution: {:?}", job_execution);
 }
 
+async fn download_output_artifacts(job_execution_id: String) {
+    // Utilizing the rust SDK, get an existing job execution
+    let job_execution = rust_sdk::api::job_execution::get(job_execution_id).await;
+
+    if job_execution.status != JobExecutionStatus::Completed {
+        panic!("Cannot download artifacts for a job that has not yet been completed");
+    }
+
+    // Create directory for job
+    let job_root_path = job_execution.id.to_string();
+    fs::create_dir_all(job_root_path.clone()).expect("Could not create job output directory");
+
+    // Change directory into directory
+    env::set_current_dir(job_root_path).expect("Could not change directories");
+
+    // Get list of output artifacts for job execution
+    let artifacts = rust_sdk::api::artifact::list(doc! {
+        "artifact_type": serde_json::to_string(&ArtifactType::Output).unwrap().replace("\"", ""),
+        "entity_id": job_execution.id,
+        "status": serde_json::to_string(&ArtifactStatus::Active).unwrap().replace("\"", "")
+    })
+    .await;
+
+    // For each artifact in job execution, download it, untar it, and then remove the tar file
+    let task_handles = artifacts.into_iter().map(|artifact| {
+        tokio::spawn(async move {
+            //  Download artifact
+            let tar_file_path = format!("{}.tar", artifact.id.to_string());
+
+            let download_artifact_response =
+                rust_sdk::api::artifact::download(artifact.id.to_string()).await;
+            let response = reqwest::get(download_artifact_response.uri).await.unwrap();
+
+            let mut artifact_file = File::create(&tar_file_path).unwrap();
+            let mut content = Cursor::new(response.bytes().await.unwrap());
+            std::io::copy(&mut content, &mut artifact_file)
+                .expect("Could not copy artifact to file");
+
+            //  Untar the artifact
+            Command::new("tar")
+                .arg("-xvf")
+                .arg(tar_file_path.clone())
+                .status()
+                .expect("Could not untar the output artifact");
+
+            //  Delete tar file
+            Command::new("rm")
+                .arg(tar_file_path)
+                .status()
+                .expect("Could not delete tar file");
+        })
+    });
+
+    for handler in task_handles {
+        handler.await.expect("Could not upload ouput artifact");
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args = Arguments::parse();
@@ -309,5 +378,8 @@ async fn main() {
         create_job_execution(args.job_id.expect("--job-id required")).await;
     } else if args.get_job_execution {
         get_job_execution(args.job_execution_id.expect("--job-execution-id required")).await;
+    } else if args.download_output_artifacts {
+        download_output_artifacts(args.job_execution_id.expect("--job-execution-id required"))
+            .await;
     }
 }
